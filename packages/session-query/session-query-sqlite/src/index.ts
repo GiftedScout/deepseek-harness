@@ -528,7 +528,8 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
           const afterSnapshots = await persistence.list(listOptions)
           assertNotAborted(signal)
           const after = materializePersistenceSnapshots(afterSnapshots)
-          if (!samePersistenceSnapshots(persisted, after)) continue
+          // Live snapshots supply these skipped logs; their durable revisions may advance.
+          if (!samePersistenceSnapshots(persisted, after, initiallyLive)) continue
           if (this._persistenceBinding !== persistenceBinding) continue
         } catch (error: unknown) {
           if (isAbort(error) || signal?.aborted) {
@@ -911,13 +912,14 @@ function materializePersistenceSnapshots(
 function samePersistenceSnapshots(
   before: ReadonlyMap<SessionId, ObservedPersistedSession>,
   after: ReadonlyMap<SessionId, ObservedPersistedSession>,
+  liveIds: ReadonlySet<SessionId>,
 ): boolean {
   if (before.size !== after.size) return false
   for (const [id, first] of before) {
     const second = after.get(id)
     if (
       second === undefined
-      || first.revision !== second.revision
+      || (!liveIds.has(id) && first.revision !== second.revision)
       || !sameHeader(first.header, second.header)
     ) return false
   }

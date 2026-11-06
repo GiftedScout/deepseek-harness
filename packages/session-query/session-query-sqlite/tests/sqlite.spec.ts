@@ -1,6 +1,6 @@
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { Context, type Fiber } from '@deepseek-ai/cordis'
 import { DatabaseSync } from 'node:sqlite'
 import { chmod, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
@@ -858,6 +858,185 @@ describe('SQLite reconciliation and source lifecycle', () => {
       .resolves.toMatchObject({ items: [{ header: shared, live: false, persisted: true }] })
     expect(TestPersistence.reads.get(shared.id)).toBe(1)
     await persistence.dispose()
+  })
+
+  it.each(['sessions', 'events'] as const)('searches %s without rereading cold logs when live persistence revisions advance', async (kind) => {
+    const shared = header('advancing-live', 10)
+    const cold = header('unchanged-cold')
+    TestPersistence.reset([
+      { meta: shared, events: messageEvents('persisted base') },
+      { meta: cold, events: messageEvents('cold needle') },
+    ])
+    const ctx = await liveContext()
+    onTestFinished(() => ctx.fiber.dispose())
+    const live = ctx.sessions.prepare(shared.id, {
+      seed: messageEvents('live base'), meta: { createdAt: shared.createdAt },
+    })
+    const detach = ctx.sessions.enter(live)
+    ctx.sessions.announce(live)
+    await ctx.plugin(TestPersistence)
+    let checkpoints = 0
+    TestPersistence.listEffect = () => {
+      checkpoints += 1
+      live.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: `live needle checkpoint${checkpoints}` }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      TestPersistence.set({ meta: live.header, events: [...live.snapshotEvents()] })
+    }
+
+    if (kind === 'sessions') {
+      const page = await ctx.sessionQuery.searchSessions({ query: 'needle' })
+      expect(page.items.map(item => item.header.id).sort()).toEqual([cold.id, shared.id].sort())
+    } else {
+      const page = await ctx.sessionQuery.searchEvents({ sessionId: shared.id, query: 'needle' })
+      expect(page.items).toHaveLength(2)
+    }
+    expect(checkpoints).toBe(2)
+    expect(TestPersistence.reads.get(cold.id)).toBe(1)
+    expect(TestPersistence.reads.get(shared.id)).toBeUndefined()
+    TestPersistence.listEffect = undefined
+    const appended = await ctx.sessionQuery.searchEvents({ sessionId: shared.id, query: 'checkpoint2' })
+    expect(appended.items).toHaveLength(1)
+    expect(appended.items[0]?.snippet).toContain('checkpoint2')
+    detach()
+    await expect(ctx.sessionQuery.searchSessions({ query: 'checkpoint2' }))
+      .resolves.toMatchObject({ items: [{ header: shared, live: false, persisted: true }] })
+    expect(TestPersistence.reads.get(shared.id)).toBe(1)
+    expect(TestPersistence.reads.get(cold.id)).toBe(1)
+  })
+
+  it('still retries changed cold history while live persistence revisions advance', async () => {
+    const shared = header('advancing-live', 10)
+    const cold = header('changed-cold')
+    TestPersistence.reset([
+      { meta: shared, events: messageEvents('live needle') },
+      { meta: cold, events: messageEvents('old needle') },
+    ])
+    const ctx = await liveContext()
+    onTestFinished(() => ctx.fiber.dispose())
+    ctx.sessions.create(shared.id, { seed: messageEvents('live needle'), meta: { createdAt: shared.createdAt } })
+    await ctx.plugin(TestPersistence)
+    TestPersistence.listEffect = () => {
+      TestPersistence.revisions.set(shared.id, ++TestPersistence.nextRevision)
+    }
+    TestPersistence.readEffect = () => {
+      TestPersistence.set({ meta: cold, events: messageEvents('updated needle') })
+    }
+
+    await expect(ctx.sessionQuery.searchSessions({ query: 'updated' }))
+      .resolves.toMatchObject({ items: [{ header: cold, live: false, persisted: true }] })
+    expect(TestPersistence.listSignals).toHaveLength(4)
+    expect(TestPersistence.reads.get(cold.id)).toBe(2)
+    expect(TestPersistence.reads.get(shared.id)).toBeUndefined()
+  })
+
+  it('loads the final durable content when a live owner detaches during cold observation', async () => {
+    const shared = header('detaching-live', 10)
+    const cold = header('other-cold')
+    TestPersistence.reset([
+      { meta: shared, events: messageEvents('old durable') },
+      { meta: cold, events: messageEvents('cold needle') },
+    ])
+    const ctx = await liveContext()
+    onTestFinished(() => ctx.fiber.dispose())
+    const live = ctx.sessions.prepare(shared.id, {
+      seed: messageEvents('live needle'), meta: { createdAt: shared.createdAt },
+    })
+    const detach = ctx.sessions.enter(live)
+    ctx.sessions.announce(live)
+    await ctx.plugin(TestPersistence)
+    TestPersistence.readEffect = () => {
+      TestPersistence.set({ meta: shared, events: messageEvents('final needle') })
+      detach()
+    }
+
+    await expect(ctx.sessionQuery.searchSessions({ query: 'final' }))
+      .resolves.toMatchObject({ items: [{ header: shared, live: false, persisted: true }] })
+    expect(TestPersistence.listSignals).toHaveLength(4)
+    expect(TestPersistence.reads.get(shared.id)).toBe(1)
+    expect(TestPersistence.reads.get(cold.id)).toBe(2)
+  })
+
+  it('does not ignore unstable persisted headers for live sessions', async () => {
+    const shared = header('unstable-live-header', 10)
+    TestPersistence.reset([{ meta: shared, events: messageEvents('persisted needle') }])
+    const ctx = await liveContext()
+    onTestFinished(() => ctx.fiber.dispose())
+    ctx.sessions.create(shared.id, { seed: messageEvents('live needle'), meta: { createdAt: shared.createdAt } })
+    await ctx.plugin(TestPersistence)
+    let changes = 0
+    TestPersistence.listEffect = () => {
+      changes += 1
+      TestPersistence.set({ meta: { ...shared, createdAt: shared.createdAt + changes }, events: [] })
+    }
+
+    await expect(ctx.sessionQuery.searchSessions({ query: 'needle' }))
+      .rejects.toThrow(expectCode('SESSION_QUERY_PERSISTENCE_FAILED'))
+    expect(changes).toBe(4)
+    expect(TestPersistence.reads.get(shared.id)).toBeUndefined()
+  })
+
+  it('preserves cursors across live persistence revisions and invalidates only changed content', async () => {
+    const shared = header('cursor-live', 10)
+    const cold = header('cursor-cold')
+    const events = [
+      ...messageEvents('needle one', 10),
+      { ...messageEvents('needle two', 11)[0]!, seq: SessionSeq(1) },
+    ]
+    TestPersistence.reset([
+      { meta: shared, events },
+      { meta: cold, events },
+    ])
+    const ctx = await liveContext()
+    onTestFinished(() => ctx.fiber.dispose())
+    const live = ctx.sessions.create(shared.id, { seed: events, meta: { createdAt: shared.createdAt } })
+    await ctx.plugin(TestPersistence)
+
+    const sessionPage = await ctx.sessionQuery.searchSessions({ query: 'needle', limit: 1 })
+    const livePage = await ctx.sessionQuery.searchEvents({ sessionId: shared.id, query: 'needle', limit: 1 })
+    const coldPage = await ctx.sessionQuery.searchEvents({ sessionId: cold.id, query: 'needle', limit: 1 })
+    expect(sessionPage.nextCursor).toEqual(expect.any(String))
+    expect(livePage.nextCursor).toEqual(expect.any(String))
+    expect(coldPage.nextCursor).toEqual(expect.any(String))
+    if (sessionPage.nextCursor === undefined || livePage.nextCursor === undefined || coldPage.nextCursor === undefined) {
+      throw new Error('expected cursors')
+    }
+    expect(TestPersistence.reads.get(cold.id)).toBe(1)
+    TestPersistence.listEffect = () => {
+      TestPersistence.revisions.set(shared.id, ++TestPersistence.nextRevision)
+    }
+
+    const nextSessionPage = await ctx.sessionQuery.searchSessions({
+      query: 'needle', limit: 1, cursor: sessionPage.nextCursor,
+    })
+    expect(nextSessionPage.items).toHaveLength(1)
+    expect(nextSessionPage.items[0]?.header.id).not.toBe(sessionPage.items[0]?.header.id)
+    const nextLivePage = await ctx.sessionQuery.searchEvents({
+      sessionId: shared.id, query: 'needle', limit: 1, cursor: livePage.nextCursor,
+    })
+    expect(nextLivePage.items).toMatchObject([{ sessionId: shared.id }])
+    expect(nextLivePage.items[0]?.seq).not.toBe(livePage.items[0]?.seq)
+    const nextColdPage = await ctx.sessionQuery.searchEvents({
+      sessionId: cold.id, query: 'needle', limit: 1, cursor: coldPage.nextCursor,
+    })
+    expect(nextColdPage.items).toMatchObject([{ sessionId: cold.id }])
+    expect(nextColdPage.items[0]?.seq).not.toBe(coldPage.items[0]?.seq)
+    expect(TestPersistence.reads.get(cold.id)).toBe(1)
+
+    live.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'needle three' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    await expect(ctx.sessionQuery.searchSessions({
+      query: 'needle', limit: 1, cursor: sessionPage.nextCursor,
+    })).rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+    await expect(ctx.sessionQuery.searchEvents({
+      sessionId: shared.id, query: 'needle', limit: 1, cursor: livePage.nextCursor,
+    })).rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+    await expect(ctx.sessionQuery.searchEvents({
+      sessionId: cold.id, query: 'needle', limit: 1, cursor: coldPage.nextCursor,
+    })).resolves.toMatchObject({ items: nextColdPage.items })
+    expect(TestPersistence.reads.get(cold.id)).toBe(1)
+    expect(TestPersistence.reads.get(shared.id)).toBeUndefined()
   })
 
   it('retries when a live owner attaches during persistence observation', async () => {
